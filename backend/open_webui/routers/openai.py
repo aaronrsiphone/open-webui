@@ -1356,6 +1356,174 @@ async def responses(
             await cleanup_response(r, session)
 
 
+class CompletionForm(BaseModel):
+    model: str
+    prompt: str | list
+
+    model_config = ConfigDict(extra="allow")
+
+
+@router.post("/completions")
+async def generate_openai_completion(
+    request: Request,
+    form_data: dict,
+    user=Depends(get_verified_user),
+):
+    # NOTE: We intentionally do NOT use Depends(get_session) here.
+    # Database operations (get_model_by_id, AccessGrants.has_access) manage their own short-lived sessions.
+    # This prevents holding a connection during the entire LLM call (30-60+ seconds),
+    # which would exhaust the connection pool under concurrent load.
+    idx = 0
+
+    payload = {**form_data}
+    metadata = payload.pop("metadata", None)
+
+    model_id = form_data.get("model")
+    model_info = Models.get_model_by_id(model_id)
+
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+            model_id = model_info.base_model_id
+
+        params = model_info.params.model_dump()
+
+        if params:
+            payload = apply_model_params_to_body_openai(params, payload)
+
+        # Check if user has access to the model
+        if user.role == "user":
+            user_group_ids = {
+                group.id for group in Groups.get_groups_by_member_id(user.id)
+            }
+            if not (
+                user.id == model_info.user_id
+                or AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type="model",
+                    resource_id=model_info.id,
+                    permission="read",
+                    user_group_ids=user_group_ids,
+                )
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Model not found",
+                )
+    else:
+        if user.role != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="Model not found",
+            )
+
+    # Check if model is already in app state cache to avoid expensive get_all_models() call
+    models = request.app.state.OPENAI_MODELS
+    if not models or model_id not in models:
+        await get_all_models(request, user=user)
+        models = request.app.state.OPENAI_MODELS
+
+    model = models.get(model_id)
+    if model:
+        idx = model["urlIdx"]
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="Model not found",
+        )
+
+    # Get the API config for the model
+    api_config = request.app.state.config.OPENAI_API_CONFIGS.get(
+        str(idx),
+        request.app.state.config.OPENAI_API_CONFIGS.get(
+            request.app.state.config.OPENAI_API_BASE_URLS[idx], {}
+        ),  # Legacy support
+    )
+
+    prefix_id = api_config.get("prefix_id", None)
+    if prefix_id:
+        payload["model"] = payload["model"].replace(f"{prefix_id}.", "")
+
+    url = request.app.state.config.OPENAI_API_BASE_URLS[idx]
+    key = request.app.state.config.OPENAI_API_KEYS[idx]
+
+    if "logit_bias" in payload and payload["logit_bias"]:
+        logit_bias = convert_logit_bias_input_to_json(payload["logit_bias"])
+        if logit_bias:
+            payload["logit_bias"] = json.loads(logit_bias)
+
+    headers, cookies = await get_headers_and_cookies(
+        request, url, key, api_config, metadata, user=user
+    )
+
+    if api_config.get("azure", False):
+        api_version = api_config.get("api_version", "2023-03-15-preview")
+        model_name = payload.get("model", "")
+
+        auth_type = api_config.get("auth_type", "bearer")
+        if auth_type not in ("azure_ad", "microsoft_entra_id"):
+            headers["api-key"] = key
+
+        headers["api-version"] = api_version
+        request_url = f"{url}/openai/deployments/{model_name}/completions?api-version={api_version}"
+    else:
+        request_url = f"{url}/completions"
+
+    payload = json.dumps(payload)
+
+    r = None
+    session = None
+    streaming = False
+    response = None
+
+    try:
+        session = aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        )
+
+        r = await session.request(
+            method="POST",
+            url=request_url,
+            data=payload,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        )
+
+        # Check if response is SSE
+        if "text/event-stream" in r.headers.get("Content-Type", ""):
+            streaming = True
+            return StreamingResponse(
+                stream_wrapper(r, session, stream_chunks_handler),
+                status_code=r.status,
+                headers=dict(r.headers),
+            )
+        else:
+            try:
+                response = await r.json()
+            except Exception as e:
+                log.error(e)
+                response = await r.text()
+
+            if r.status >= 400:
+                if isinstance(response, (dict, list)):
+                    return JSONResponse(status_code=r.status, content=response)
+                else:
+                    return PlainTextResponse(status_code=r.status, content=response)
+
+            return response
+    except Exception as e:
+        log.exception(e)
+
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail="Open WebUI: Server Connection Error",
+        )
+    finally:
+        if not streaming:
+            await cleanup_response(r, session)
+
+
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
     """
